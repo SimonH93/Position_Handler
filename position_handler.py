@@ -11,8 +11,8 @@ import base64
 from dotenv import load_dotenv
 
 # --- Konfiguration und Konstanten ---
-# Loggt standardmäßig INFO, WARNING, ERROR, CRITICAL. Debug-Meldungen werden unterdrückt.
-# Wenn Sie weniger sehen möchten, setzen Sie es auf logging.WARNING
+
+# Setzt das Logging-Level auf INFO: Wichtige Schritte, Warnungen und Fehler werden angezeigt.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout) 
 
 # Bitget API Endpunkte
@@ -23,10 +23,11 @@ CANCEL_PLAN_URL = "/api/mix/v1/plan/cancelPlan"
 PLACE_PLAN_URL = "/api/mix/v1/plan/placePlan"
 TIME_URL = "/api/v2/public/time" 
 
-# --- Globale Variablen ---
+# --- Globale Variablen und Initialisierung ---
+
 TIME_OFFSET_MS = 0 
 
-# --- Umgebungsvariablen laden ---
+# Umgebungsvariablen laden
 load_dotenv() 
 
 API_KEY = os.getenv("BITGET_API_KEY")
@@ -35,17 +36,15 @@ PASSPHRASE = os.getenv("BITGET_PASSWORD")
 
 if not all([API_KEY, SECRET_KEY, PASSPHRASE]):
     print("FATAL ERROR: Umgebungsvariablen (BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD) fehlen. Programm wird beendet.")
-    # Reduziert: Fehlerlog bleibt kritisch
     logging.critical("Umgebungsvariablen fehlen. Beende Programm.") 
     sys.exit(1)
 
-# Reduziert: Erfolgsmeldung bleibt
 logging.info("Umgebungsvariablen erfolgreich geladen und geprüft.") 
 
 # --- Hilfsfunktionen für die API-Kommunikation ---
 
 def generate_bitget_signature(timestamp: str, method: str, request_path: str, body: str = "") -> str:
-    """Generiert die Bitget API-Signatur (Base64-kodiert)."""
+    """Generiert die Bitget API-Signatur (Base64-kodiert) basierend auf den Request-Details."""
     message = timestamp + method.upper() + request_path + body
     hmac_key = SECRET_KEY.encode('utf-8')
     h = hmac.new(hmac_key, message.encode('utf-8'), hashlib.sha256)
@@ -58,7 +57,7 @@ def get_bitget_timestamp() -> str:
     return str(int(time.time() * 1000) + TIME_OFFSET_MS)
 
 def get_headers(method: str, path: str, body: dict = None) -> dict:
-    """Erstellt die notwendigen HTTP-Header für Bitget."""
+    """Erstellt die notwendigen HTTP-Header für Bitget, inklusive Signatur."""
     timestamp = get_bitget_timestamp() 
     body_str = json.dumps(body, separators=(',', ':')) if body else "" 
     signature = generate_bitget_signature(timestamp, method, path, body_str)
@@ -73,7 +72,7 @@ def get_headers(method: str, path: str, body: dict = None) -> dict:
     }
 
 async def make_api_request(client: httpx.AsyncClient, method: str, url: str, params: dict = None, json_data: dict = None):
-    """Führt einen API-Request aus und verarbeitet Fehler (nutzt übergebenen Client)."""
+    """Führt einen API-Request aus und verarbeitet gängige Bitget-Fehler."""
     method = method.upper()
     path = url.replace(BASE_URL, '')
     
@@ -95,19 +94,17 @@ async def make_api_request(client: httpx.AsyncClient, method: str, url: str, par
         data = response.json()
         
         if data.get("code") != "00000":
-            # Tolerierte Fehler bleiben als WARNING
+            # Tolerierte Fehler (z.B. Order existiert nicht mehr)
             if data.get("code") in ["40034", "43020"]:
                 logging.warning(f"Bitget API Fehler (Code: {data.get('code')}): Order existiert nicht. IGNORIERE.")
                 return {} 
                 
-            # Bei anderen Fehlern: Nur kritische Daten loggen
             logging.error(f"Bitget API Fehler (Code: {data.get('code')}): {data.get('msg')} für {path}")
             return None
         
         return data.get("data")
     
     except httpx.HTTPStatusError as e:
-        # HTTP Status Fehler bleiben detailliert, da sie oft schwer zu debuggen sind
         logging.error(f"HTTP-Statusfehler beim Aufruf von {path}: {e.response.status_code}")
         
         try:
@@ -121,24 +118,15 @@ async def make_api_request(client: httpx.AsyncClient, method: str, url: str, par
         except Exception:
             pass 
 
-        try:
-            response_text = e.response.text
-        except Exception:
-            response_text = "Kein Response-Text verfügbar."
-        
-        # Details auf Debug Level reduzieren
-        logging.debug(f"-> Response Body (Text): {response_text}")
-        logging.debug(f"-> Response Header: {dict(e.response.headers)}")
         return None
     
     except httpx.RequestError as e:
-        # Netzwerkfehler bleiben wichtig
         logging.error(f"Netzwerk- oder Request-Fehler beim Aufruf von {path}: {e}")
         return None
 
 
 async def sync_server_time():
-    """Ruft die Bitget Serverzeit ab und berechnet den Zeitversatz."""
+    """Ruft die Bitget Serverzeit ab und berechnet den Zeitversatz zur lokalen Uhr."""
     global TIME_OFFSET_MS
     
     logging.info("Synchronisiere Zeit mit Bitget Server...")
@@ -158,7 +146,6 @@ async def sync_server_time():
                 try:
                     server_timestamp = int(server_timestamp_raw)
                 except (ValueError, TypeError):
-                    # Reduziert: Fehlerlog bleibt
                     logging.error(f"Konvertierungsfehler: Konnte Server-Timestamp ({server_timestamp_raw}) nicht in Integer umwandeln.")
                     server_timestamp = 0
             
@@ -177,7 +164,7 @@ async def sync_server_time():
 # --- Kernlogik des Handlers ---
 
 async def get_all_open_positions(client: httpx.AsyncClient):
-    """Ruft alle offenen Positionen ab und gibt ein Dictionary zurück: {symbol: size}."""
+    """Ruft alle offenen Positionen ab und gibt ein Dictionary zurück: {symbol: position_data}."""
     logging.info("Schritt 1: Rufe alle offenen Positionen ab.")
     
     params = {"productType": "UMCBL"}
@@ -193,7 +180,6 @@ async def get_all_open_positions(client: httpx.AsyncClient):
             try:
                 hold_size = float(total_size_raw)
             except (ValueError, TypeError):
-                # Reduziert: Fehlerlog bleibt
                 logging.error(f"Fehler beim Konvertieren der Positionsgröße 'total' für {pos.get('symbol')}.")
                 continue
 
@@ -210,17 +196,13 @@ async def get_all_open_positions(client: httpx.AsyncClient):
                     "side": pos["holdSide"],
                     "entry_price": entry_price
                 }
-                # Reduziert: Wichtige Positionen bleiben INFO
                 logging.info(f"-> Position gefunden: {symbol}, Größe: {hold_size:.4f}, Seite: {pos['holdSide']}")
             
-            # Reduziert: Null-Positionen auf DEBUG
             elif hold_size == 0 and pos.get("symbol"):
                 logging.debug(f"-> Ignoriere Null-Position/Hedge-Side: {pos['symbol']}")
 
         if not open_positions:
-            # Log bleibt wichtig
             logging.warning("API-Aufruf lieferte Daten, aber keine aktive Position (> 0 Größe) gefunden.")
-            # Entfernt: Die langen Warnungen über Kontotypen etc. (Einmaliger Check genügt)
     
     elif positions_data is None:
         logging.error("API-Anfrage für Positionen ist fehlgeschlagen.")
@@ -230,16 +212,17 @@ async def get_all_open_positions(client: httpx.AsyncClient):
     return open_positions
 
 async def get_sl_and_tp_orders(client: httpx.AsyncClient):
-    """Ruft alle ausstehenden Plan-Orders ab und identifiziert SL- und TP-Orders (gefiltert auf Market-Orders)."""
+    """Ruft alle ausstehenden Plan-Orders ab und sammelt alle Market SL/TP Orders pro Symbol."""
     logging.info("Schritt 2: Rufe alle ausstehenden Conditional Orders ab.")
     
     params = {"productType": "UMCBL"}
     plan_orders_raw = await make_api_request(client, "GET", BASE_URL + PLAN_URL, params=params)
     
-    sl_orders = {}
+    # sl_orders speichert eine LISTE von Orders pro Symbol
+    sl_orders = {} 
     plan_orders_list = []
 
-    # Straffung der Logik zur Extraktion der Order-Liste
+    # Extrahiert die Order-Liste aus verschiedenen API-Antwortformaten
     if isinstance(plan_orders_raw, list):
         plan_orders_list = plan_orders_raw
     elif isinstance(plan_orders_raw, dict):
@@ -247,13 +230,11 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
             plan_orders_list = plan_orders_raw["planList"]
         elif plan_orders_raw.get("orderList"):
             plan_orders_list = plan_orders_raw["orderList"]
-        # Reduziert: Das Loggen der erfolgreichen Extraktion entfällt
     elif plan_orders_raw is None:
         logging.warning("Keine Conditional Order Daten von der API erhalten.")
         return sl_orders
     
     if plan_orders_list:
-        # Reduziert: Die Order-Objekt-Prüfung wurde gestrafft.
         for order in plan_orders_list:
             
             if not all(k in order for k in ["symbol", "orderId", "size", "triggerPrice"]):
@@ -262,29 +243,31 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
 
             symbol = order["symbol"]
             
+            # Filtert nur nach Market Plan Orders (Typische SL/TP Orders)
             if order.get("orderType") == "market": 
-                sl_orders[symbol] = {
+                order_data = {
                     "planId": order["orderId"],
                     "size": float(order["size"]),
                     "triggerPrice": float(order["triggerPrice"])
                 }
-                # Reduziert: Wichtige Order-Infos bleiben INFO
-                logging.info(f"-> SL-Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order['size']}")
+                if symbol not in sl_orders:
+                    sl_orders[symbol] = []
+                sl_orders[symbol].append(order_data)
+                
+                logging.info(f"-> SL-Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order['size']}, Trigger: {order_data['triggerPrice']}")
             else:
-                # Reduziert: Ignorierte Orders auf DEBUG
                 logging.debug(f"-> Ignoriere Nicht-Market Plan Order: {symbol}, Type: {order.get('orderType')}")
 
     return sl_orders
 
 async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: dict, new_size: float, position_side: str, entry_price: float | None):
-    """Storniert die alte SL-Order und platziert eine neue mit korrigierter Größe."""
+    """Storniert die alte SL-Order und platziert eine neue mit korrigierter, voller Positionsgröße."""
     
     old_plan_id = old_sl["planId"]
     old_size = old_sl["size"]
     trigger_price = old_sl["triggerPrice"]
     rounded_trigger_price = round(trigger_price, 4)
 
-    # Korrektur-Logs bleiben als WARNING / INFO (wichtige Vorgänge)
     logging.warning(f"--- KORREKTUR ERFORDERLICH für {symbol} ---")
     logging.warning(f"  Position: {new_size:.4f}, SL-Order: {old_size:.4f} (Plan-ID: {old_plan_id})")
     
@@ -301,7 +284,7 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
     cancel_result = await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
 
     if cancel_result is None:
-        logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Korrektur.")
+        logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Platzierung.")
         return
     elif cancel_result == {}:
         logging.warning(f"  -> Stornierungsversuch fehlgeschlagen (Order existierte nicht). Platziere dennoch neue SL-Order.")
@@ -343,7 +326,7 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
 
 
 async def run_sl_correction_check(client: httpx.AsyncClient):
-    """Die Hauptfunktion, die alle Schritte des Polling-Prozesses durchläuft."""
+    """Führt den Haupt-Check durch: Abruf, Konsolidierung von SL-Orders und Korrektur der Größe."""
     
     open_positions = await get_all_open_positions(client)
     
@@ -351,7 +334,8 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
         logging.info("Keine offenen Positionen gefunden. Beende Check.")
         return
 
-    sl_orders = await get_sl_and_tp_orders(client)
+    # sl_orders_by_symbol enthält Listen von SL-Orders pro Symbol
+    sl_orders_by_symbol = await get_sl_and_tp_orders(client)
 
     corrected_count = 0
     missing_sl_symbols = [] 
@@ -361,40 +345,80 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
         position_side = pos_data["side"]
         entry_price = pos_data["entry_price"] 
         
-        if symbol in sl_orders:
-            sl_data = sl_orders[symbol]
-            registered_sl_size = sl_data["size"]
+        sl_orders_for_symbol = sl_orders_by_symbol.get(symbol, [])
+        
+        # --- KONSOLIDIERUNG VON MEHRFACH-SL-ORDERS ---
+        
+        if len(sl_orders_for_symbol) > 1:
+            logging.warning(f"*** MEHRFACH-SL FÜR {symbol} ERKANNT ({len(sl_orders_for_symbol)} Orders). KONSOLIDIERE. ***")
             
-            if abs(current_size - registered_sl_size) > 0.0001:
-                logging.info(f"*** ABWEICHUNG ERKANNT für {symbol} ***")
-                # Reduziert: Nur die Fakten loggen
-                logging.info(f"  - Offene Größe: {current_size:.4f}, SL-Größe: {registered_sl_size:.4f}")
+            # 1. Optimalen SL finden (höher bei Long, tiefer bei Short, um den höchsten/niedrigsten Trigger zu behalten)
+            if position_side == "long":
+                # Max-Trigger-Preis nehmen (höchstes SL-Level = geringster Verlust)
+                optimal_sl = max(sl_orders_for_symbol, key=lambda x: x['triggerPrice'])
+            else: # short
+                # Min-Trigger-Preis nehmen (niedrigstes SL-Level = geringster Verlust)
+                optimal_sl = min(sl_orders_for_symbol, key=lambda x: x['triggerPrice'])
+            
+            logging.warning(f"  -> Optimaler SL gewählt: Trigger {optimal_sl['triggerPrice']:.4f}, Plan-ID {optimal_sl['planId']}")
+            
+            # 2. Alle anderen Orders stornieren
+            orders_to_cancel = [o for o in sl_orders_for_symbol if o['planId'] != optimal_sl['planId']]
+            
+            for old_sl in orders_to_cancel:
+                logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
                 
-                await cancel_and_replace_sl(
-                    client=client, 
-                    symbol=symbol, 
-                    old_sl=sl_data, 
-                    new_size=current_size, 
-                    position_side=position_side,
-                    entry_price=entry_price
-                )
-                corrected_count += 1
-            else:
-                # Reduziert: Synchrone Positionen auf DEBUG
-                logging.debug(f"Position für {symbol} ist synchronisiert. Größe: {current_size:.4f}")
+                cancel_payload = {
+                    "symbol": symbol,
+                    "productType": "UMCBL",
+                    "marginCoin": "USDT", 
+                    "orderId": old_sl["planId"], 
+                    "planType": "normal_plan" 
+                }
+                await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
+            
+            # Setze die optimale Order als die zu prüfende Order
+            sl_data = optimal_sl
+            
+        elif len(sl_orders_for_symbol) == 1:
+            sl_data = sl_orders_for_symbol[0]
         else:
+            # Keine SL-Orders gefunden
             missing_sl_symbols.append(symbol)
             logging.warning(f"Offene Position für {symbol} hat KEINE aktive SL-Order.")
+            continue
+
+        # --- GRÖSSENPRÜFUNG (Korrektur nur, wenn SL zu groß ist) ---
+        
+        registered_sl_size = sl_data["size"]
+        
+        # Korrigiere nur, wenn die SL-Order-Größe größer ist als die aktuelle Position (+ Toleranz).
+        # Zu kleine Orders werden ignoriert, um partielle SL/TP zu ermöglichen.
+        if registered_sl_size > current_size + 0.0001: 
+            logging.info(f"*** ABWEICHUNG ERKANNT (SL ist ZU GROSS) für {symbol} ***")
+            logging.info(f"  - Offene Größe: {current_size:.4f}, SL-Größe: {registered_sl_size:.4f}")
+            
+            # new_size ist die aktuelle Positionsgröße, old_sl ist die beibehaltene optimale Order
+            await cancel_and_replace_sl(
+                client=client, 
+                symbol=symbol, 
+                old_sl=sl_data, 
+                new_size=current_size, 
+                position_side=position_side,
+                entry_price=entry_price
+            )
+            corrected_count += 1
+        else:
+            logging.debug(f"Position für {symbol} ist synchronisiert oder partiell abgedeckt (SL-Größe: {registered_sl_size:.4f}).")
 
     if missing_sl_symbols:
         logging.warning(f"ZUSAMMENFASSUNG: Für die folgenden Symbole fehlen aktive Stop-Loss Orders: {', '.join(missing_sl_symbols)}.")
 
-    # Reduziert: Erfolgsmeldung bleibt
     logging.info(f"Polling-Durchlauf abgeschlossen. Korrigierte SL-Orders: {corrected_count}.")
 
 
 async def main_loop():
-    """Führt einen einzelnen Durchlauf des Position Handlers aus (für Cron-Scheduler)."""
+    """Führt einen einzelnen Durchlauf des Position Handlers aus."""
     await sync_server_time()
     
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
