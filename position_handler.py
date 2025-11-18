@@ -131,8 +131,6 @@ async def sync_server_time():
     
     logging.info("Synchronisiere Zeit mit Bitget Server...")
     
-    local_timestamp_start = int(time.time() * 1000)
-    
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=5.0) as client:
         try:
             response = await client.get(TIME_URL)
@@ -185,16 +183,22 @@ async def get_all_open_positions(client: httpx.AsyncClient):
 
             if hold_size > 0:
                 symbol = pos["symbol"]
-                entry_price_raw = pos.get("averageOpenPrice", pos.get("averageOpenPriceUsd"))
+                
+                # Extrahieren des angehängten SL/TP Preises
+                sl_price = float(pos.get("stopLossPrice")) if pos.get("stopLossPrice") else None
+                tp_price = float(pos.get("takeProfitPrice")) if pos.get("takeProfitPrice") else None
+
                 try:
-                    entry_price = float(entry_price_raw)
+                    entry_price = float(pos.get("averageOpenPrice", pos.get("averageOpenPriceUsd")))
                 except (ValueError, TypeError):
                     entry_price = None 
                     
                 open_positions[symbol] = {
                     "size": hold_size, 
                     "side": pos["holdSide"],
-                    "entry_price": entry_price
+                    "entry_price": entry_price,
+                    "stop_loss_price": sl_price,
+                    "take_profit_price": tp_price
                 }
                 logging.info(f"-> Position gefunden: {symbol}, Größe: {hold_size:.4f}, Seite: {pos['holdSide']}")
             
@@ -212,17 +216,16 @@ async def get_all_open_positions(client: httpx.AsyncClient):
     return open_positions
 
 async def get_sl_and_tp_orders(client: httpx.AsyncClient):
-    """Ruft alle ausstehenden Plan-Orders ab und sammelt alle Market SL/TP Orders pro Symbol."""
+    """Ruft alle ausstehenden Plan-Orders ab und sammelt alle Conditional Market Orders pro Symbol."""
     logging.info("Schritt 2: Rufe alle ausstehenden Conditional Orders ab.")
     
     params = {"productType": "UMCBL"}
     plan_orders_raw = await make_api_request(client, "GET", BASE_URL + PLAN_URL, params=params)
     
-    # sl_orders speichert eine LISTE von Orders pro Symbol
+    # sl_orders speichert eine LISTE von Conditional Market Orders pro Symbol
     sl_orders = {} 
     plan_orders_list = []
 
-    # Extrahiert die Order-Liste aus verschiedenen API-Antwortformaten
     if isinstance(plan_orders_raw, list):
         plan_orders_list = plan_orders_raw
     elif isinstance(plan_orders_raw, dict):
@@ -243,7 +246,7 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
 
             symbol = order["symbol"]
             
-            # Filtert nur nach Market Plan Orders (Typische SL/TP Orders)
+            # Filtert nur nach Market Plan Orders (diese erfordern die Größenkorrektur und sind potentielle SL/TPs)
             if order.get("orderType") == "market": 
                 order_data = {
                     "planId": order["orderId"],
@@ -254,11 +257,23 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
                     sl_orders[symbol] = []
                 sl_orders[symbol].append(order_data)
                 
-                logging.info(f"-> SL-Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order['size']}, Trigger: {order_data['triggerPrice']}")
+                logging.info(f"-> Conditional Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order['size']}, Trigger: {order_data['triggerPrice']}")
             else:
                 logging.debug(f"-> Ignoriere Nicht-Market Plan Order: {symbol}, Type: {order.get('orderType')}")
 
     return sl_orders
+
+async def cancel_conditional_order(client: httpx.AsyncClient, symbol: str, plan_id: str):
+    """Storniert eine Conditional Order anhand ihrer Plan-ID."""
+    cancel_payload = {
+        "symbol": symbol,
+        "productType": "UMCBL",
+        "marginCoin": "USDT", 
+        "orderId": plan_id, 
+        "planType": "normal_plan" 
+    }
+    # Rückgabe des Ergebnisses ist hier optional, da wir nur die Ausführung benötigen
+    await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
 
 async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: dict, new_size: float, position_side: str, entry_price: float | None):
     """Storniert die alte SL-Order und platziert eine neue mit korrigierter, voller Positionsgröße."""
@@ -272,16 +287,8 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
     logging.warning(f"  Position: {new_size:.4f}, SL-Order: {old_size:.4f} (Plan-ID: {old_plan_id})")
     
     # 1. Storniere die alte, überdimensionierte SL-Order
-    cancel_payload = {
-        "symbol": symbol,
-        "productType": "UMCBL",
-        "marginCoin": "USDT", 
-        "orderId": old_plan_id, 
-        "planType": "normal_plan" 
-    }
     logging.info(f"  -> Storniere alte SL-Order {old_plan_id}...")
-    
-    cancel_result = await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
+    cancel_result = await cancel_conditional_order(client, symbol, old_plan_id)
 
     if cancel_result is None:
         logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Platzierung.")
@@ -324,18 +331,54 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
     else:
         logging.error("  !! Kritischer Fehler: Neue SL-Order konnte nicht platziert werden.")
 
-
-async def run_sl_correction_check(client: httpx.AsyncClient):
-    """Führt den Haupt-Check durch: Abruf, Konsolidierung von SL-Orders und Korrektur der Größe."""
+async def cancel_orphan_plan_orders(client: httpx.AsyncClient, open_positions: dict, all_plan_orders: dict):
+    """Storniert Plan Orders (SL/TP), deren Symbol keine offene Position mehr hat."""
+    logging.info("Schritt 3: Suche und storniere verwaiste Plan Orders.")
     
-    open_positions = await get_all_open_positions(client)
+    # Symbole mit offenen Positionen
+    active_symbols = set(open_positions.keys())
     
-    if not open_positions:
-        logging.info("Keine offenen Positionen gefunden. Beende Check.")
+    # Symbole mit Conditional Orders
+    order_symbols = set(all_plan_orders.keys())
+    
+    # Symbole, bei denen Conditional Orders existieren, aber keine Position
+    orphan_symbols = order_symbols.difference(active_symbols)
+    
+    if not orphan_symbols:
+        logging.info("-> Keine verwaisten Plan Orders gefunden. Alles sauber.")
         return
 
-    # sl_orders_by_symbol enthält Listen von SL-Orders pro Symbol
-    sl_orders_by_symbol = await get_sl_and_tp_orders(client)
+    storno_count = 0
+    
+    for symbol in orphan_symbols:
+        orders_to_cancel = all_plan_orders[symbol]
+        
+        logging.warning(f"*** VERWAISTE ORDERS gefunden für {symbol} ({len(orders_to_cancel)} Orders). Storniere...")
+        
+        for order in orders_to_cancel:
+            plan_id = order["planId"]
+            trigger = order["triggerPrice"]
+            
+            logging.info(f"  -> Storniere Plan-ID {plan_id} (Trigger: {trigger:.4f})")
+            
+            await cancel_conditional_order(client, symbol, plan_id)
+            storno_count += 1
+            
+    logging.info(f"ZUSAMMENFASSUNG: {storno_count} verwaiste Plan Orders storniert.")
+
+
+async def run_sl_correction_check(client: httpx.AsyncClient):
+    """Führt den Haupt-Check durch: Abruf, Konsolidierung von SL-Orders, Korrektur und Aufräumen."""
+    
+    open_positions = await get_all_open_positions(client)
+    # Schritt 2 und 4 benötigen alle Conditional Orders
+    all_plan_orders = await get_sl_and_tp_orders(client) 
+    
+    if not open_positions:
+        logging.info("Keine offenen Positionen gefunden.")
+        # Wenn keine Positionen offen sind, sind alle Conditional Orders verwaist.
+        await cancel_orphan_plan_orders(client, open_positions, all_plan_orders)
+        return
 
     corrected_count = 0
     missing_sl_symbols = [] 
@@ -344,61 +387,63 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
         current_size = pos_data["size"]
         position_side = pos_data["side"]
         entry_price = pos_data["entry_price"] 
+        attached_sl_price = pos_data.get("stop_loss_price") 
+
+        sl_orders_for_symbol = all_plan_orders.get(symbol, [])
         
-        sl_orders_for_symbol = sl_orders_by_symbol.get(symbol, [])
-        
-        # --- KONSOLIDIERUNG VON MEHRFACH-SL-ORDERS ---
+        # --- PRÜFUNG 1: ANGEHÄNGTER SL VORHANDEN? ---
+        if attached_sl_price and attached_sl_price > 0:
+            logging.info(f"Position {symbol} ist durch einen ANGEHÄNGTEN Stop Loss geschützt (Preis: {attached_sl_price:.4f}).")
+            
+            # Konfliktvermeidung: Wenn ein angehängter SL existiert, alle Conditional Orders löschen
+            if sl_orders_for_symbol:
+                logging.warning(f"  -> ACHTUNG: {len(sl_orders_for_symbol)} zusätzliche Conditional Orders gefunden. Storniere, um Konflikte zu vermeiden.")
+                for old_sl in sl_orders_for_symbol:
+                    logging.info(f"  -> Storniere Konflikt-Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
+                    await cancel_conditional_order(client, symbol, old_sl['planId'])
+            
+            continue # Nächste Position prüfen
+
+        # --- PRÜFUNG 2: KONSOLIDIERUNG VON MEHRFACH-SL-ORDERS (NUR CONDITIONAL ORDERS) ---
         
         if len(sl_orders_for_symbol) > 1:
-            logging.warning(f"*** MEHRFACH-SL FÜR {symbol} ERKANNT ({len(sl_orders_for_symbol)} Orders). KONSOLIDIERE. ***")
+            logging.warning(f"*** MEHRFACH-SL FÜR {symbol} ERKANNT ({len(sl_orders_for_symbol)} Conditional Orders). KONSOLIDIERE. ***")
             
-            # 1. Optimalen SL finden (höher bei Long, tiefer bei Short, um den höchsten/niedrigsten Trigger zu behalten)
+            # 1. Optimalen SL finden (höher bei Long, tiefer bei Short = minimaler Verlust)
             if position_side == "long":
-                # Max-Trigger-Preis nehmen (höchstes SL-Level = geringster Verlust)
                 optimal_sl = max(sl_orders_for_symbol, key=lambda x: x['triggerPrice'])
             else: # short
-                # Min-Trigger-Preis nehmen (niedrigstes SL-Level = geringster Verlust)
                 optimal_sl = min(sl_orders_for_symbol, key=lambda x: x['triggerPrice'])
             
             logging.warning(f"  -> Optimaler SL gewählt: Trigger {optimal_sl['triggerPrice']:.4f}, Plan-ID {optimal_sl['planId']}")
             
-            # 2. Alle anderen Orders stornieren
+            # 2. Alle anderen Conditional Orders stornieren
             orders_to_cancel = [o for o in sl_orders_for_symbol if o['planId'] != optimal_sl['planId']]
             
             for old_sl in orders_to_cancel:
                 logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
-                
-                cancel_payload = {
-                    "symbol": symbol,
-                    "productType": "UMCBL",
-                    "marginCoin": "USDT", 
-                    "orderId": old_sl["planId"], 
-                    "planType": "normal_plan" 
-                }
-                await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
+                await cancel_conditional_order(client, symbol, old_sl['planId'])
             
-            # Setze die optimale Order als die zu prüfende Order
+            # Die optimale Order für die anschließende Größenprüfung verwenden
             sl_data = optimal_sl
             
         elif len(sl_orders_for_symbol) == 1:
             sl_data = sl_orders_for_symbol[0]
         else:
-            # Keine SL-Orders gefunden
+            # Keine SL-Orders (weder angehängt noch Conditional) gefunden
             missing_sl_symbols.append(symbol)
             logging.warning(f"Offene Position für {symbol} hat KEINE aktive SL-Order.")
             continue
 
-        # --- GRÖSSENPRÜFUNG (Korrektur nur, wenn SL zu groß ist) ---
+        # --- PRÜFUNG 3: GRÖSSENKORREKTUR (NUR FÜR DIE ÜBRIGE CONDITIONAL ORDER) ---
         
         registered_sl_size = sl_data["size"]
         
         # Korrigiere nur, wenn die SL-Order-Größe größer ist als die aktuelle Position (+ Toleranz).
-        # Zu kleine Orders werden ignoriert, um partielle SL/TP zu ermöglichen.
         if registered_sl_size > current_size + 0.0001: 
-            logging.info(f"*** ABWEICHUNG ERKANNT (SL ist ZU GROSS) für {symbol} ***")
+            logging.info(f"*** ABWEICHUNG ERKANNT (Conditional SL ist ZU GROSS) für {symbol} ***")
             logging.info(f"  - Offene Größe: {current_size:.4f}, SL-Größe: {registered_sl_size:.4f}")
             
-            # new_size ist die aktuelle Positionsgröße, old_sl ist die beibehaltene optimale Order
             await cancel_and_replace_sl(
                 client=client, 
                 symbol=symbol, 
@@ -409,11 +454,14 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             )
             corrected_count += 1
         else:
-            logging.debug(f"Position für {symbol} ist synchronisiert oder partiell abgedeckt (SL-Größe: {registered_sl_size:.4f}).")
+            logging.debug(f"Position für {symbol} ist synchronisiert oder partiell abgedeckt (Conditional SL-Größe: {registered_sl_size:.4f}).")
 
     if missing_sl_symbols:
         logging.warning(f"ZUSAMMENFASSUNG: Für die folgenden Symbole fehlen aktive Stop-Loss Orders: {', '.join(missing_sl_symbols)}.")
 
+    # Am Ende der Prüfungen: Starte das Aufräumen der Waisen-Orders.
+    await cancel_orphan_plan_orders(client, open_positions, all_plan_orders)
+    
     logging.info(f"Polling-Durchlauf abgeschlossen. Korrigierte SL-Orders: {corrected_count}.")
 
 
