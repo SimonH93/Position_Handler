@@ -188,10 +188,19 @@ async def get_all_open_positions(client: httpx.AsyncClient):
                 sl_price = float(pos.get("stopLossPrice")) if pos.get("stopLossPrice") else None
                 tp_price = float(pos.get("takeProfitPrice")) if pos.get("takeProfitPrice") else None
 
-                try:
-                    entry_price = float(pos.get("averageOpenPrice", pos.get("averageOpenPriceUsd")))
-                except (ValueError, TypeError):
-                    entry_price = None 
+                entry_price = None
+                
+                entry_price_raw = pos.get("averageOpenPrice") or pos.get("averageOpenPriceUsd")
+
+                if entry_price_raw:
+                    try:
+                        entry_price = float(entry_price_raw)
+                    except (ValueError, TypeError):
+                        logging.error(f"FEHLER: Konnte Einstiegspreis '{entry_price_raw}' für {symbol} nicht in Float umwandeln.")
+                
+                if entry_price is None or entry_price <= 0:
+                     logging.warning(f"WARNUNG: Einstiegspreis (Entry Price) für {symbol} konnte nicht korrekt abgerufen werden oder ist 0/None. Conditional SL/TP Check wird übersprungen.")
+                     # Hier setzen wir entry_price absichtlich auf None, aber loggen die Warnung
                     
                 open_positions[symbol] = {
                     "size": hold_size, 
@@ -216,14 +225,17 @@ async def get_all_open_positions(client: httpx.AsyncClient):
     return open_positions
 
 async def get_sl_and_tp_orders(client: httpx.AsyncClient):
-    """Ruft alle ausstehenden Plan-Orders ab und sammelt alle Conditional Market Orders pro Symbol."""
+    """
+    Ruft alle ausstehenden Plan-Orders ab und sammelt diese. 
+    Wichtig: Sammelt ALLE Plan-Orders, unabhängig vom Typ, um sie auf 'verwaist' prüfen zu können.
+    """
     logging.info("Schritt 2: Rufe alle ausstehenden Conditional Orders ab.")
     
     params = {"productType": "UMCBL"}
     plan_orders_raw = await make_api_request(client, "GET", BASE_URL + PLAN_URL, params=params)
     
-    # sl_orders speichert eine LISTE von Conditional Market Orders pro Symbol
-    sl_orders = {} 
+    # all_plan_orders speichert eine LISTE von Conditional Orders pro Symbol
+    all_plan_orders = {} 
     plan_orders_list = []
 
     if isinstance(plan_orders_raw, list):
@@ -235,8 +247,8 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
             plan_orders_list = plan_orders_raw["orderList"]
     elif plan_orders_raw is None:
         logging.warning("Keine Conditional Order Daten von der API erhalten.")
-        return sl_orders
-    
+        return all_plan_orders # Korrekte Rückgabe
+
     if plan_orders_list:
         for order in plan_orders_list:
             
@@ -245,23 +257,36 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
                 continue
 
             symbol = order["symbol"]
+            order_side = order.get("side")
+
+            if order_side not in ["close_long", "close_short"]:
+                 logging.debug(f"Ignoriere Plan Order {order['orderId']} für {symbol}: Nicht-Schließungs-Side ({order_side}).")
+                 continue
             
-            # Filtert nur nach Market Plan Orders (diese erfordern die Größenkorrektur und sind potentielle SL/TPs)
-            if order.get("orderType") == "market": 
+            # --- KORRIGIERTE LOGIK: Sammelt ALLE Plan Orders zur Stornierung ---
+            # Der vorherige Filter (orderType == "market") wurde entfernt.
+            
+            try:
                 order_data = {
                     "planId": order["orderId"],
                     "size": float(order["size"]),
-                    "triggerPrice": float(order["triggerPrice"])
+                    "triggerPrice": float(order["triggerPrice"]),
+                    "side": order["side"],
+                    "orderType": order.get("orderType") # Typ für Debugging/Logging
                 }
-                if symbol not in sl_orders:
-                    sl_orders[symbol] = []
-                sl_orders[symbol].append(order_data)
-                
-                logging.info(f"-> Conditional Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order['size']}, Trigger: {order_data['triggerPrice']}")
-            else:
-                logging.debug(f"-> Ignoriere Nicht-Market Plan Order: {symbol}, Type: {order.get('orderType')}")
+            except (ValueError, TypeError) as e:
+                 logging.error(f"Fehler bei Konvertierung in Order-Data für {symbol}: {e}. Überspringe.")
+                 continue
+            
+            if symbol not in all_plan_orders:
+                all_plan_orders[symbol] = []
+            
+            # --- KORREKTUR der fehlerhaften Listenzuweisung/append:
+            all_plan_orders[symbol].append(order_data) 
+            
+            logging.info(f"-> Conditional Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order_data['size']}, Trigger: {order_data['triggerPrice']}, Typ: {order_data['orderType']}")
 
-    return sl_orders
+    return all_plan_orders
 
 async def cancel_conditional_order(client: httpx.AsyncClient, symbol: str, plan_id: str):
     """Storniert eine Conditional Order anhand ihrer Plan-ID."""
@@ -288,7 +313,8 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
     
     # 1. Storniere die alte, überdimensionierte SL-Order
     logging.info(f"  -> Storniere alte SL-Order {old_plan_id}...")
-    cancel_result = await cancel_conditional_order(client, symbol, old_plan_id)
+    # cancel_result wird nur benötigt, um den nächsten Schritt zu bedingen
+    cancel_result = await cancel_conditional_order(client, symbol, old_plan_id) 
 
     if cancel_result is None:
         logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Platzierung.")
@@ -358,8 +384,9 @@ async def cancel_orphan_plan_orders(client: httpx.AsyncClient, open_positions: d
         for order in orders_to_cancel:
             plan_id = order["planId"]
             trigger = order["triggerPrice"]
+            order_type = order.get("orderType", "N/A")
             
-            logging.info(f"  -> Storniere Plan-ID {plan_id} (Trigger: {trigger:.4f})")
+            logging.info(f"  -> Storniere Plan-ID {plan_id} (Trigger: {trigger:.4f}, Typ: {order_type})")
             
             await cancel_conditional_order(client, symbol, plan_id)
             storno_count += 1
@@ -371,7 +398,7 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
     """Führt den Haupt-Check durch: Abruf, Konsolidierung von SL-Orders, Korrektur und Aufräumen."""
     
     open_positions = await get_all_open_positions(client)
-    # Schritt 2 und 4 benötigen alle Conditional Orders
+    # Wichtig: all_plan_orders enthält jetzt ALLE Plan Orders, um Aufräumen zu gewährleisten.
     all_plan_orders = await get_sl_and_tp_orders(client) 
     
     if not open_positions:
@@ -388,22 +415,88 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
         position_side = pos_data["side"]
         entry_price = pos_data["entry_price"] 
         attached_sl_price = pos_data.get("stop_loss_price") 
-
-        sl_orders_for_symbol = all_plan_orders.get(symbol, [])
+        potential_plan_orders = all_plan_orders.get(symbol, [])
+        sl_orders_for_symbol = []
+        tp_orders_for_symbol = []
         
+        if entry_price is not None and entry_price > 0:
+            for order in potential_plan_orders:
+                # Da get_sl_and_tp_orders jetzt alle Typen sammelt, prüfen wir hier auf Market Orders,
+                # die für SL-Größenkorrekturen relevant sind. (Optionale Filterung je nach Strategie)
+                if order.get("orderType") != "market":
+                     logging.debug(f"Ignoriere Nicht-Market-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check.")
+                     continue
+                     
+                trigger_price = order["triggerPrice"]
+                order_side = order["side"] # Order-Side (z.B. close_long)
+
+                # Überprüfen, ob es eine Schließungs-Order ist, die der Position-Side entspricht
+                is_closing_order = (position_side == "long" and order_side == "close_long") or \
+                                   (position_side == "short" and order_side == "close_short")
+                
+                if is_closing_order:
+                    # Logische Unterscheidung SL vs TP
+                    is_sl = (position_side == "long" and trigger_price < entry_price) or \
+                            (position_side == "short" and trigger_price > entry_price)
+                            
+                    if is_sl:
+                        # Hier fügen wir die SL-relevanten Orders hinzu, die auf Größenkorrektur geprüft werden
+                        sl_orders_for_symbol.append(order)
+                    else:
+                        # Orders, die dieselbe Seite schließen, aber im Gewinn liegen (TPs)
+                        tp_orders_for_symbol.append(order)
+                else:
+                    # Orders, die die Position eröffnen (z.B. open_long) oder auf der falschen Seite schließen
+                    logging.debug(f"Ignoriere Plan Order {order['planId']} für {symbol}: Nicht-Schließungs-Order oder falsche Seite ({order_side}).")
+        
+        else:
+            # --- KORRIGIERTER FALLBACK-BLOCK (umgesetzt wie in der letzten Antwort besprochen) ---
+            logging.warning(f"WARNUNG: Einstiegspreis für {symbol} ist NULL oder fehlt. Alle Conditional Closing Market Orders werden als **potenzielle SL** für die Größenkorrektur behandelt.")
+            
+            # FALLBACK: Wenn Entry Price fehlt, behandeln wir alle Closing Orders als potenziellen SL
+            for order in potential_plan_orders:
+                 # In diesem Fall sollten wir uns wieder auf Market Orders beschränken, 
+                 # da wir nur diese Orders in diesem Script ersetzen und korrigieren wollen.
+                if order.get("orderType") != "market":
+                     logging.debug(f"Ignoriere Nicht-Market-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check (Entry-Price fehlt).")
+                     continue
+                     
+                order_side = order["side"]
+                
+                # Wir behandeln alle Closing Orders als SL-Kandidat
+                is_closing_order = (position_side == "long" and order_side == "close_long") or \
+                                   (position_side == "short" and order_side == "close_short")
+                                   
+                if is_closing_order:
+                    sl_orders_for_symbol.append(order)
+                else:
+                    # Nicht-Closing Orders ignorieren
+                    logging.debug(f"Ignoriere Plan Order {order['planId']} für {symbol}: Nicht-Schließungs-Order.")
+        # --- Ende KORRIGIERTER FALLBACK-BLOCK ---
+
         # --- PRÜFUNG 1: ANGEHÄNGTER SL VORHANDEN? ---
         if attached_sl_price and attached_sl_price > 0:
             logging.info(f"Position {symbol} ist durch einen ANGEHÄNGTEN Stop Loss geschützt (Preis: {attached_sl_price:.4f}).")
             
             # Konfliktvermeidung: Wenn ein angehängter SL existiert, alle Conditional Orders löschen
             if sl_orders_for_symbol:
-                logging.warning(f"  -> ACHTUNG: {len(sl_orders_for_symbol)} zusätzliche Conditional Orders gefunden. Storniere, um Konflikte zu vermeiden.")
+                logging.warning(f"  -> ACHTUNG: {len(sl_orders_for_symbol)} zusätzliche Conditional SL Orders gefunden. Storniere, um Konflikte zu vermeiden.")
                 for old_sl in sl_orders_for_symbol:
                     logging.info(f"  -> Storniere Konflikt-Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
                     await cancel_conditional_order(client, symbol, old_sl['planId'])
             
-            continue # Nächste Position prüfen
+            # Füge auch gefundene TPs hinzu und storniere diese, um Konflikte zu vermeiden
+            if tp_orders_for_symbol:
+                logging.warning(f"  -> ACHTUNG: {len(tp_orders_for_symbol)} Conditional TP Orders gefunden. Storniere, um Konflikte mit dem angehängten SL/TP zu vermeiden.")
+                for old_tp in tp_orders_for_symbol:
+                     logging.info(f"  -> Storniere Konflikt-TP: Plan-ID {old_tp['planId']}, Trigger {old_tp['triggerPrice']:.4f}")
+                     await cancel_conditional_order(client, symbol, old_tp['planId'])
 
+            continue # Nächste Position prüfen
+        
+        if tp_orders_for_symbol:
+            logging.info(f"-> {len(tp_orders_for_symbol)} Conditional Take Profit Orders gefunden und ignoriert (Kein angehängter SL/TP).")
+        
         # --- PRÜFUNG 2: KONSOLIDIERUNG VON MEHRFACH-SL-ORDERS (NUR CONDITIONAL ORDERS) ---
         
         if len(sl_orders_for_symbol) > 1:
