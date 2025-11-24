@@ -514,13 +514,17 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             
             # 2. Alle anderen Conditional Orders stornieren
             orders_to_cancel = [o for o in sl_orders_for_symbol if o['planId'] != optimal_sl['planId']]
-            
+            size_to_add = 0.0
             for old_sl in orders_to_cancel:
-                logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
+                size_to_add += old_sl['size']
+                logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}, Größe: {old_sl['size']:.4f}")
                 await cancel_conditional_order(client, symbol, old_sl['planId'])
             
+            new_optimal_sl_size = optimal_sl['size'] + size_to_add
+            logging.info(f"  -> Konsolidierung: Ursprungsgröße: {optimal_sl['size']:.4f}, Hinzu: {size_to_add:.4f}, Neue SL-Größe: {new_optimal_sl_size:.4f}")
             # Die optimale Order für die anschließende Größenprüfung verwenden
             sl_data = optimal_sl
+            sl_data["size"] = new_optimal_sl_size
             
         elif len(sl_orders_for_symbol) == 1:
             sl_data = sl_orders_for_symbol[0]
