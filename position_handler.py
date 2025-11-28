@@ -337,18 +337,18 @@ async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: 
         logging.error(f"  !! Fehler: Unbekannte Position Side ({position_side}). Abbruch der Platzierung.")
         return
     
-    execute_price = "0"
+    limit_price = str(rounded_trigger_price)
     
     place_payload = {
         "symbol": symbol,
         "size": str(round(new_size, 4)), 
         "side": new_side, 
-        "orderType": "market", 
+        "orderType": "limit", 
         "productType": "UMCBL",
         "marginCoin": "USDT",
         "triggerPrice": str(rounded_trigger_price),
         "triggerType": "mark_price",
-        "executePrice": execute_price 
+        "executePrice": limit_price 
     }
     
     logging.info(f"  -> Platziere neue SL-Order: Side={new_side}, Größe={new_size:.4f}, Trigger={rounded_trigger_price}")
@@ -425,8 +425,8 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             for order in potential_plan_orders:
                 # Da get_sl_and_tp_orders jetzt alle Typen sammelt, prüfen wir hier auf Market Orders,
                 # die für SL-Größenkorrekturen relevant sind. (Optionale Filterung je nach Strategie)
-                if order.get("orderType") != "market":
-                     logging.debug(f"Ignoriere Nicht-Market-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check.")
+                if order.get("orderType") != "limit":
+                     logging.debug(f"Ignoriere Nicht-Limit-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check.")
                      continue
                      
                 trigger_price = order["triggerPrice"]
@@ -459,8 +459,8 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             for order in potential_plan_orders:
                  # In diesem Fall sollten wir uns wieder auf Market Orders beschränken, 
                  # da wir nur diese Orders in diesem Script ersetzen und korrigieren wollen.
-                if order.get("orderType") != "market":
-                     logging.debug(f"Ignoriere Nicht-Market-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check (Entry-Price fehlt).")
+                if order.get("orderType") != "limit":
+                     logging.debug(f"Ignoriere Nicht-Limit-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check (Entry-Price fehlt).")
                      continue
                      
                 order_side = order["side"]
