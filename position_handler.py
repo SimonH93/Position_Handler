@@ -10,20 +10,17 @@ import sys
 import base64 
 from dotenv import load_dotenv
 
-# --- Konfiguration und Konstanten ---
 
-# Setzt das Logging-Level auf INFO: Wichtige Schritte, Warnungen und Fehler werden angezeigt.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout) 
 
 # Bitget API Endpunkte
 BASE_URL = "https://api.bitget.com"
-PLAN_URL = "/api/mix/v1/plan/currentPlan"
-POSITION_URL = "/api/mix/v1/position/allPosition" 
-CANCEL_PLAN_URL = "/api/mix/v1/plan/cancelPlan" 
-PLACE_PLAN_URL = "/api/mix/v1/plan/placePlan"
+PLAN_URL = "/api/v2/mix/order/orders-plan-pending" 
+POSITION_URL = "/api/v2/mix/position/all-position" 
+CANCEL_PLAN_URL = "/api/v2/mix/order/cancel-plan-order" 
+PLACE_PLAN_URL = "/api/v2/mix/order/place-plan-order"
 TIME_URL = "/api/v2/public/time" 
 
-# --- Globale Variablen und Initialisierung ---
 
 TIME_OFFSET_MS = 0 
 
@@ -56,10 +53,9 @@ def get_bitget_timestamp() -> str:
     global TIME_OFFSET_MS
     return str(int(time.time() * 1000) + TIME_OFFSET_MS)
 
-def get_headers(method: str, path: str, body: dict = None) -> dict:
+def get_headers(method: str, path: str, body_str: str = "") -> dict:
     """Erstellt die notwendigen HTTP-Header für Bitget, inklusive Signatur."""
-    timestamp = get_bitget_timestamp() 
-    body_str = json.dumps(body, separators=(',', ':')) if body else "" 
+    timestamp = get_bitget_timestamp()
     signature = generate_bitget_signature(timestamp, method, path, body_str)
 
     return {
@@ -76,13 +72,16 @@ async def make_api_request(client: httpx.AsyncClient, method: str, url: str, par
     method = method.upper()
     path = url.replace(BASE_URL, '')
     
-    signed_path = path
+    path_for_signature = path
+    signature_body = ""
     if method == "GET" and params:
         query_string = str(httpx.QueryParams(params)) 
         if query_string:
-            signed_path += "?" + query_string
+            path_for_signature += "?" + query_string
+    elif method == "POST" and json_data:
+        signature_body = json.dumps(json_data, separators=(',', ':'))
             
-    headers = get_headers(method, signed_path, json_data)
+    headers = get_headers(method, path_for_signature, body_str=signature_body)
 
     try:
         if method == "GET":
@@ -108,11 +107,15 @@ async def make_api_request(client: httpx.AsyncClient, method: str, url: str, par
         logging.error(f"HTTP-Statusfehler beim Aufruf von {path}: {e.response.status_code}")
         
         try:
+            error_response_text = e.response.text
+            logging.error(f"  -> Raw Bitget Error Response (Status {e.response.status_code}): {error_response_text}")
             error_data = e.response.json()
             error_code = error_data.get("code")
+            error_msg = error_data.get("msg")
+            logging.error(f"  -> Parsed Bitget Error: Code={error_code}, Msg='{error_msg}'")
             
             if e.response.status_code == 400 and error_code in ["43020", "40034"]:
-                logging.warning(f"  -> Bitget API Fehler (Code: {error_code}): Order existiert nicht (im HTTP-Fehlerblock abgefangen). IGNORIERE.")
+                logging.warning(f"  -> Bitget API Fehler (Code: {error_code}): Order existiert nicht (im HTTP-Fehlerblock abgefangen). IGNORIERE.")
                 return {} 
 
         except Exception:
@@ -165,7 +168,10 @@ async def get_all_open_positions(client: httpx.AsyncClient):
     """Ruft alle offenen Positionen ab und gibt ein Dictionary zurück: {symbol: position_data}."""
     logging.info("Schritt 1: Rufe alle offenen Positionen ab.")
     
-    params = {"productType": "UMCBL"}
+    params = {
+        "productType": "USDT-FUTURES",
+        "marginCoin": "USDT"          
+    }
     positions_data = await make_api_request(client, "GET", BASE_URL + POSITION_URL, params=params)
     
     open_positions = {}
@@ -190,7 +196,7 @@ async def get_all_open_positions(client: httpx.AsyncClient):
 
                 entry_price = None
                 
-                entry_price_raw = pos.get("averageOpenPrice") or pos.get("averageOpenPriceUsd")
+                entry_price_raw = pos.get("openPriceAvg")
 
                 if entry_price_raw:
                     try:
@@ -202,7 +208,7 @@ async def get_all_open_positions(client: httpx.AsyncClient):
                      logging.warning(f"WARNUNG: Einstiegspreis (Entry Price) für {symbol} konnte nicht korrekt abgerufen werden oder ist 0/None. Conditional SL/TP Check wird übersprungen.")
                      # Hier setzen wir entry_price absichtlich auf None, aber loggen die Warnung
                     
-                open_positions[symbol] = {
+                open_positions[f"{symbol}-{pos['holdSide']}"] = {
                     "size": hold_size, 
                     "side": pos["holdSide"],
                     "entry_price": entry_price,
@@ -231,7 +237,10 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
     """
     logging.info("Schritt 2: Rufe alle ausstehenden Conditional Orders ab.")
     
-    params = {"productType": "UMCBL"}
+    params = {
+        "productType": "USDT-FUTURES",
+        "planType": "normal_plan"
+    }
     plan_orders_raw = await make_api_request(client, "GET", BASE_URL + PLAN_URL, params=params)
     
     # all_plan_orders speichert eine LISTE von Conditional Orders pro Symbol
@@ -241,50 +250,69 @@ async def get_sl_and_tp_orders(client: httpx.AsyncClient):
     if isinstance(plan_orders_raw, list):
         plan_orders_list = plan_orders_raw
     elif isinstance(plan_orders_raw, dict):
-        if plan_orders_raw.get("planList"):
-            plan_orders_list = plan_orders_raw["planList"]
-        elif plan_orders_raw.get("orderList"):
-            plan_orders_list = plan_orders_raw["orderList"]
+        if plan_orders_raw.get("entrustedList"):
+            plan_orders_list = plan_orders_raw["entrustedList"]
     elif plan_orders_raw is None:
         logging.warning("Keine Conditional Order Daten von der API erhalten.")
-        return all_plan_orders # Korrekte Rückgabe
+        return all_plan_orders
 
     if plan_orders_list:
         for order in plan_orders_list:
             
-            if not all(k in order for k in ["symbol", "orderId", "size", "triggerPrice"]):
+            trade_side = order.get("tradeSide", "").lower()
+            
+            if trade_side == "open":
+                logging.debug(f"Ignoriere Plan Order {order.get('orderId')} für {order.get('symbol')}: Es ist eine ENTRY Order (tradeSide: open).")
+                continue
+
+            if not all(k in order for k in ["symbol", "orderId", "size"]):
                 logging.warning(f"Order-Objekt unvollständig. Überspringe.")
                 continue
 
             symbol = order["symbol"]
             order_side = order.get("side")
 
-            if order_side not in ["close_long", "close_short"]:
-                 logging.debug(f"Ignoriere Plan Order {order['orderId']} für {symbol}: Nicht-Schließungs-Side ({order_side}).")
-                 continue
-            
-            # --- KORRIGIERTE LOGIK: Sammelt ALLE Plan Orders zur Stornierung ---
-            # Der vorherige Filter (orderType == "market") wurde entfernt.
-            
             try:
+                order_size = float(order.get("size"))
+                trigger_price = float(order.get("triggerPrice"))
+                price_raw = order.get("price") or order.get("executePrice")
+                price_value = float(price_raw) if price_raw and str(price_raw).strip() else 0.0
                 order_data = {
                     "planId": order["orderId"],
-                    "size": float(order["size"]),
-                    "triggerPrice": float(order["triggerPrice"]),
+                    "size": order_size,
+                    "orderType": order.get("orderType"),
+                    "price": price_value,
                     "side": order["side"],
-                    "orderType": order.get("orderType") # Typ für Debugging/Logging
+                    "triggerPrice": trigger_price
                 }
+                
             except (ValueError, TypeError) as e:
                  logging.error(f"Fehler bei Konvertierung in Order-Data für {symbol}: {e}. Überspringe.")
                  continue
             
-            if symbol not in all_plan_orders:
-                all_plan_orders[symbol] = []
+            if order_side == "sell":
+                position_side = "long"
+            elif order_side == "buy":
+                position_side = "short"
+            else:
+                logging.debug(f"Ignoriere Plan Order {order['orderId']} für {symbol}: Nicht-Schließungs-Side ({order_side}).")
+                continue
             
-            # --- KORREKTUR der fehlerhaften Listenzuweisung/append:
-            all_plan_orders[symbol].append(order_data) 
+            if position_side:
+                full_key = f"{symbol}-{position_side}"
+
+            elif order_side in ["open_long", "open_short"]:
+                logging.debug(f"Ignoriere Plan Order {order_data['planId']} für {symbol}: Opening Side ({order_side}).")
+                continue
+            else:
+                logging.debug(f"Ignoriere Plan Order {order_data['planId']} für {symbol}: Unbekannte Side ({order_side}).")
+                continue
             
-            logging.info(f"-> Conditional Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order_data['size']}, Trigger: {order_data['triggerPrice']}, Typ: {order_data['orderType']}")
+            if full_key not in all_plan_orders:
+                all_plan_orders[full_key] = []
+            
+            all_plan_orders[full_key].append(order_data) 
+            logging.info(f"-> Conditional Order gefunden: {symbol}, Plan-ID: {order['orderId']}, Größe: {order_data['size']}, Price: {order_data['price']}")
 
     return all_plan_orders
 
@@ -292,72 +320,80 @@ async def cancel_conditional_order(client: httpx.AsyncClient, symbol: str, plan_
     """Storniert eine Conditional Order anhand ihrer Plan-ID."""
     cancel_payload = {
         "symbol": symbol,
-        "productType": "UMCBL",
+        "productType": "USDT-FUTURES",
         "marginCoin": "USDT", 
-        "orderId": plan_id, 
-        "planType": "normal_plan" 
+        "orderIdList": [ 
+            {
+                "orderId": plan_id
+            }
+        ]
     }
     # Rückgabe des Ergebnisses ist hier optional, da wir nur die Ausführung benötigen
     return await make_api_request(client, "POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
 
 
-async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: dict, new_size: float, position_side: str, entry_price: float | None):
+async def cancel_and_replace_sl(client: httpx.AsyncClient, symbol: str, old_sl: dict, new_size: float, position_side: str, triggerPrice: float | None):
     """Storniert die alte SL-Order und platziert eine neue mit korrigierter, voller Positionsgröße."""
     
     old_plan_id = old_sl["planId"]
     old_size = old_sl["size"]
     trigger_price = old_sl["triggerPrice"]
-    rounded_trigger_price = round(trigger_price, 4)
+    rounded_trigger_price = round(triggerPrice, 4)
 
     logging.warning(f"--- KORREKTUR ERFORDERLICH für {symbol} ---")
-    logging.warning(f"  Position: {new_size:.4f}, SL-Order: {old_size:.4f} (Plan-ID: {old_plan_id})")
+    logging.warning(f"  Position: {new_size:.4f}, SL-Order: {old_size:.4f} (Plan-ID: {old_plan_id})")
     
     # 1. Storniere die alte, überdimensionierte SL-Order
-    logging.info(f"  -> Storniere alte SL-Order {old_plan_id}...")
+    logging.info(f"  -> Storniere alte SL-Order {old_plan_id}...")
     # cancel_result wird nur benötigt, um den nächsten Schritt zu bedingen
     cancel_result = await cancel_conditional_order(client, symbol, old_plan_id) 
 
     if cancel_result is None:
-        logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Platzierung.")
+        logging.error(f"  !! Fehler beim Stornieren der SL-Order {old_plan_id}. Abbruch der Platzierung.")
         return
     
     if cancel_result == {}:
-        logging.warning(f"  -> Stornierungsversuch fehlgeschlagen (Order existierte nicht oder tolerierbarer API-Fehler). Platziere dennoch neue SL-Order.")
+        logging.warning(f"  -> Stornierungsversuch fehlgeschlagen (Order existierte nicht oder tolerierbarer API-Fehler). Platziere dennoch neue SL-Order.")
     else:
         # Stornierung war erfolgreich (Code 00000)
-        logging.info(f"  -> Stornierung erfolgreich. Platziere neue SL-Order.")
+        logging.info(f"  -> Stornierung erfolgreich. Platziere neue SL-Order.")
 
     # 2. Platziere die neue SL-Order mit der korrekten Größe (new_size)
     
     if position_side == "long":
-        new_side = "close_long"
+        new_side = "sell"
     elif position_side == "short":
-        new_side = "close_short"
+        new_side = "buy"
     else:
-        logging.error(f"  !! Fehler: Unbekannte Position Side ({position_side}). Abbruch der Platzierung.")
+        logging.error(f"  !! Fehler: Unbekannte Position Side ({position_side}). Abbruch der Platzierung.")
         return
     
     limit_price = str(rounded_trigger_price)
-    
+    trade_side = "close"
+
     place_payload = {
         "symbol": symbol,
         "size": str(round(new_size, 4)), 
-        "side": new_side, 
+        "side": new_side,
+        "tradeSide": trade_side,
         "orderType": "limit", 
-        "productType": "UMCBL",
+        "productType": "USDT-FUTURES",
         "marginCoin": "USDT",
+        "planType": "normal_plan",
         "triggerPrice": str(rounded_trigger_price),
+        "executePrice": limit_price,
         "triggerType": "mark_price",
-        "executePrice": limit_price 
+        "marginMode": "crossed",
+        "reduceOnly": "YES"
     }
     
-    logging.info(f"  -> Platziere neue SL-Order: Side={new_side}, Größe={new_size:.4f}, Trigger={rounded_trigger_price}")
+    logging.info(f"  -> Platziere neue SL-Order: Side={new_side}, TradeSide={trade_side}, Größe={new_size:.4f}, Trigger={rounded_trigger_price}")
     new_order_result = await make_api_request(client, "POST", BASE_URL + PLACE_PLAN_URL, json_data=place_payload)
     
     if new_order_result:
-        logging.info(f"  -> Korrektur erfolgreich! Neue Plan-ID: {new_order_result.get('orderId')}")
+        logging.info(f"  -> Korrektur erfolgreich! Neue Plan-ID: {new_order_result.get('orderId')}")
     else:
-        logging.error("  !! Kritischer Fehler: Neue SL-Order konnte nicht platziert werden.")
+        logging.error("  !! Kritischer Fehler: Neue SL-Order konnte nicht platziert werden.")
 
 async def cancel_orphan_plan_orders(client: httpx.AsyncClient, open_positions: dict, all_plan_orders: dict):
     """Storniert Plan Orders (SL/TP), deren Symbol keine offene Position mehr hat."""
@@ -378,19 +414,25 @@ async def cancel_orphan_plan_orders(client: httpx.AsyncClient, open_positions: d
 
     storno_count = 0
     
-    for symbol in orphan_symbols:
-        orders_to_cancel = all_plan_orders[symbol]
+    for symbol_key in orphan_symbols:
+        orders_to_cancel = all_plan_orders[symbol_key]
         
-        logging.warning(f"*** VERWAISTE ORDERS gefunden für {symbol} ({len(orders_to_cancel)} Orders). Storniere...")
+        try:
+            trading_symbol = symbol_key.rsplit('-', 1)[0]
+        except IndexError:
+            logging.error(f"Konnte Trading-Symbol nicht aus Key '{symbol_key}' extrahieren. Überspringe Stornierung.")
+            continue
+        
+        logging.warning(f"*** VERWAISTE ORDERS gefunden für {trading_symbol} ({len(orders_to_cancel)} Orders). Storniere...")
         
         for order in orders_to_cancel:
             plan_id = order["planId"]
             trigger = order["triggerPrice"]
             order_type = order.get("orderType", "N/A")
             
-            logging.info(f"  -> Storniere Plan-ID {plan_id} (Trigger: {trigger:.4f}, Typ: {order_type})")
+            logging.info(f"  -> Storniere Plan-ID {plan_id} (Trigger: {trigger:.4f}, Typ: {order_type})")
             
-            await cancel_conditional_order(client, symbol, plan_id)
+            await cancel_conditional_order(client, trading_symbol, plan_id)
             storno_count += 1
             
     logging.info(f"ZUSAMMENFASSUNG: {storno_count} verwaiste Plan Orders storniert.")
@@ -425,8 +467,8 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             for order in potential_plan_orders:
                 # Da get_sl_and_tp_orders jetzt alle Typen sammelt, prüfen wir hier auf Market Orders,
                 # die für SL-Größenkorrekturen relevant sind. (Optionale Filterung je nach Strategie)
-                if order.get("orderType") != "limit":
-                     logging.debug(f"Ignoriere Nicht-Limit-Plan-Order {order['planId']} für {symbol} (Typ: {order['orderType']}) im SL-Check.")
+                if order.get("orderType") not in ["limit", "market"]:
+                     logging.debug(f"Ignoriere Plan-Order {order['planId']} für {symbol}: Unbekannter oder nicht unterstützter Typ ({order['orderType']}).")
                      continue
                      
                 trigger_price = order["triggerPrice"]
@@ -482,16 +524,16 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             
             # Konfliktvermeidung: Wenn ein angehängter SL existiert, alle Conditional Orders löschen
             if sl_orders_for_symbol:
-                logging.warning(f"  -> ACHTUNG: {len(sl_orders_for_symbol)} zusätzliche Conditional SL Orders gefunden. Storniere, um Konflikte zu vermeiden.")
+                logging.warning(f"  -> ACHTUNG: {len(sl_orders_for_symbol)} zusätzliche Conditional SL Orders gefunden. Storniere, um Konflikte zu vermeiden.")
                 for old_sl in sl_orders_for_symbol:
-                    logging.info(f"  -> Storniere Konflikt-Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
+                    logging.info(f"  -> Storniere Konflikt-Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}")
                     await cancel_conditional_order(client, symbol, old_sl['planId'])
             
             # Füge auch gefundene TPs hinzu und storniere diese, um Konflikte zu vermeiden
             if tp_orders_for_symbol:
-                logging.warning(f"  -> ACHTUNG: {len(tp_orders_for_symbol)} Conditional TP Orders gefunden. Storniere, um Konflikte mit dem angehängten SL/TP zu vermeiden.")
+                logging.warning(f"  -> ACHTUNG: {len(tp_orders_for_symbol)} Conditional TP Orders gefunden. Storniere, um Konflikte mit dem angehängten SL/TP zu vermeiden.")
                 for old_tp in tp_orders_for_symbol:
-                     logging.info(f"  -> Storniere Konflikt-TP: Plan-ID {old_tp['planId']}, Trigger {old_tp['triggerPrice']:.4f}")
+                     logging.info(f"  -> Storniere Konflikt-TP: Plan-ID {old_tp['planId']}, Trigger {old_tp['triggerPrice']:.4f}")
                      await cancel_conditional_order(client, symbol, old_tp['planId'])
 
             continue # Nächste Position prüfen
@@ -510,18 +552,18 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
             else: # short
                 optimal_sl = min(sl_orders_for_symbol, key=lambda x: x['triggerPrice'])
             
-            logging.warning(f"  -> Optimaler SL gewählt: Trigger {optimal_sl['triggerPrice']:.4f}, Plan-ID {optimal_sl['planId']}")
+            logging.warning(f"  -> Optimaler SL gewählt: Trigger {optimal_sl['triggerPrice']:.4f}, Plan-ID {optimal_sl['planId']}")
             
             # 2. Alle anderen Conditional Orders stornieren
             orders_to_cancel = [o for o in sl_orders_for_symbol if o['planId'] != optimal_sl['planId']]
             size_to_add = 0.0
             for old_sl in orders_to_cancel:
                 size_to_add += old_sl['size']
-                logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}, Größe: {old_sl['size']:.4f}")
+                logging.info(f"  -> Storniere Duplikat: Plan-ID {old_sl['planId']}, Trigger {old_sl['triggerPrice']:.4f}, Größe: {old_sl['size']:.4f}")
                 await cancel_conditional_order(client, symbol, old_sl['planId'])
             
             new_optimal_sl_size = optimal_sl['size'] + size_to_add
-            logging.info(f"  -> Konsolidierung: Ursprungsgröße: {optimal_sl['size']:.4f}, Hinzu: {size_to_add:.4f}, Neue SL-Größe: {new_optimal_sl_size:.4f}")
+            logging.info(f"  -> Konsolidierung: Ursprungsgröße: {optimal_sl['size']:.4f}, Hinzu: {size_to_add:.4f}, Neue SL-Größe: {new_optimal_sl_size:.4f}")
             # Die optimale Order für die anschließende Größenprüfung verwenden
             sl_data = optimal_sl
             sl_data["size"] = new_optimal_sl_size
@@ -541,15 +583,17 @@ async def run_sl_correction_check(client: httpx.AsyncClient):
         # Korrigiere nur, wenn die SL-Order-Größe größer ist als die aktuelle Position (+ Toleranz).
         if registered_sl_size > current_size + 0.0001: 
             logging.info(f"*** ABWEICHUNG ERKANNT (Conditional SL ist ZU GROSS) für {symbol} ***")
-            logging.info(f"  - Offene Größe: {current_size:.4f}, SL-Größe: {registered_sl_size:.4f}")
+            logging.info(f"  - Offene Größe: {current_size:.4f}, SL-Größe: {registered_sl_size:.4f}")
             
+            original_trigger_price = sl_data["triggerPrice"]
+
             await cancel_and_replace_sl(
                 client=client, 
                 symbol=symbol, 
                 old_sl=sl_data, 
                 new_size=current_size, 
                 position_side=position_side,
-                entry_price=entry_price
+                triggerPrice=original_trigger_price
             )
             corrected_count += 1
         else:
