@@ -146,6 +146,9 @@ class BitgetClient:
         params = {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
         data = await self.request("GET", POSITION_URL, params=params)
         
+        if data is None:
+            return None
+
         positions = {} # Key: "SYMBOL-SIDE" (z.B. BTCUSDT-long)
         if data:
             for item in data:
@@ -205,6 +208,10 @@ async def sync_database_state(session, bitget: BitgetClient):
     # 2. Hole echte Positionen von Bitget
     bitget_positions = await bitget.get_open_positions()
     
+    if bitget_positions is None:
+        logging.critical("Konnte Positionen nicht von Bitget laden. Breche Sync ab, um Datenverlust zu vermeiden.")
+        return [], None
+
     if not db_signals:
         logging.info(f"Keine aktiven Trades in der Datenbank. {len(bitget_positions)} Bitget Positionen aktiv.")
         # WICHTIGE KORREKTUR: Gib die echten Positionen zurück, damit cleanup_orphaned_orders sie nicht löscht.
@@ -331,6 +338,10 @@ async def cleanup_orphaned_orders(bitget_positions, bitget: BitgetClient):
     """
     all_orders = await bitget.get_plan_orders()
     
+    if all_orders is None:
+        logging.error("Konnte Plan Orders nicht von Bitget abrufen. Breche Order-Cleanup ab.")
+        return
+
     # Set mit Strings "SYMBOL-SIDE" der offenen Positionen
     active_position_keys = set(bitget_positions.keys())
     
@@ -378,6 +389,10 @@ async def main():
         # Schritt 1: DB Sync & Positionen holen
         active_signals, bitget_positions = await sync_database_state(session, bitget)
         
+        if bitget_positions is None:
+            logging.error("SICHERHEITSSTOPP: Da Positionsdaten fehlen, werden keine TPs geprüft und keine Orders gelöscht.")
+            return
+
         # Schritt 2: TPs prüfen (nur wenn Trades aktiv sind)
         if active_signals:
             await check_take_profits(session, active_signals, bitget)
