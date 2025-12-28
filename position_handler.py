@@ -83,11 +83,9 @@ class BitgetClient:
         async with httpx.AsyncClient(timeout=10) as client:
             try:
                 if method == "GET":
-                    # WICHTIG: Wir übergeben params=None, da sie bereits in full_url stecken!
                     resp = await client.get(full_url, headers=headers)
                 else:
-                    resp = await client.post(full_url, headers=headers, data=body)
-                
+                    resp = await client.post(full_url, headers=headers, content=body)
                 return resp.json()
             except Exception as e:
                 logging.error(f"API Request Error: {e}")
@@ -132,7 +130,7 @@ async def cleanup_orphaned_orders(bitget_positions, bitget):
             
             cancel_payload = {
                 "symbol": symbol,
-                "productType": "UMCBL",
+                "productType": "USDT-FUTURES",
                 "orderId": order.get('orderId')
             }
             del_resp = await bitget.request("POST", "/api/v2/mix/order/cancel-plan-order", data=cancel_payload)
